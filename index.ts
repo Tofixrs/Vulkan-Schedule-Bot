@@ -16,9 +16,16 @@ import type {
 	ScheduleMeta,
 } from "./types.js";
 
-interface State {
+interface ClassState {
 	hash: number | null;
 	schedule: Lesson[][];
+}
+
+type State = Record<string, ClassState>;
+
+interface ClassConfig {
+	name: string;
+	webhooks: string[];
 }
 
 const LOG_URL = Bun.env.LOG_URL ?? Bun.env.LOG_WEBHOOK;
@@ -28,14 +35,66 @@ const WEBHOOKS = (Bun.env.WEBHOOKS ?? Bun.env.ANNOUNCE_URL ?? "")
 	.map((value) => value.trim())
 	.filter(Boolean);
 
-let state: State = await Bun.file("./state.json")
+let state: State = {};
+
+const rawState: unknown = await Bun.file("./state.json")
 	.json()
-	.catch(() => ({ hash: null, schedule: [] }));
+	.catch(() => null);
+if (rawState && typeof rawState === "object" && !Array.isArray(rawState)) {
+	state = rawState as State;
+}
 
 function requiredEnv(name: string): string {
 	const value = Bun.env[name];
 	if (!value) throw new Error(`Missing required environment variable: ${name}`);
 	return value;
+}
+
+function parseClassConfig(): ClassConfig[] {
+	const raw = (Bun.env.CLASS_WEBHOOKS ?? "").trim();
+	if (!raw) {
+		const name = requiredEnv("CLASS").trim();
+		return [{ name, webhooks: WEBHOOKS }];
+	}
+
+	const classes = new Map<string, string[]>();
+	for (const entry of raw.replace(/\\n/g, "\n").split(/[\n;]/)) {
+		const line = entry.trim();
+		if (!line || line.startsWith("#")) continue;
+
+		const separator = line.indexOf("=");
+		if (separator === -1) {
+			throw new Error(
+				`Invalid CLASS_WEBHOOKS entry (expected CLASS=webhook): ${line}`,
+			);
+		}
+
+		const name = line.slice(0, separator).trim();
+		const webhooks = line
+			.slice(separator + 1)
+			.split(",")
+			.map((value) => value.trim())
+			.filter(Boolean);
+
+		if (!name || webhooks.length === 0) {
+			throw new Error(
+				`Invalid CLASS_WEBHOOKS entry (expected CLASS=webhook): ${line}`,
+			);
+		}
+
+		const existing = classes.get(name) ?? [];
+		classes.set(name, [...new Set([...existing, ...webhooks])]);
+	}
+
+	if (classes.size === 0) {
+		throw new Error("CLASS_WEBHOOKS is set but contains no classes");
+	}
+
+	return [...classes].map(([name, webhooks]) => ({ name, webhooks }));
+}
+
+async function saveState() {
+	await Bun.write("./state.json", JSON.stringify(state));
 }
 
 function schoolFetch(url: string) {
@@ -47,7 +106,7 @@ function schoolFetch(url: string) {
 
 async function main() {
 	const baseUrl = requiredEnv("BASE_URL").replace(/\/+$/, "");
-	const className = requiredEnv("CLASS");
+	const classes = parseClassConfig();
 	const listUrl = `${baseUrl}/lista.html`;
 	const runOnce = Bun.env.RUN_ONCE === "1";
 	const interval = Number(Bun.env.CHECK_INTERVAL_MS ?? 1000 * 60);
@@ -55,23 +114,26 @@ async function main() {
 	if (!LOG_URL) {
 		console.warn("LOG_URL is not set; logs will only go to the console");
 	}
-	if (WEBHOOKS.length === 0) {
-		console.warn("No WEBHOOKS configured; rendered plans will not be posted");
+	if (classes.reduce((sum, cls) => sum + cls.webhooks.length, 0) === 0) {
+		console.warn("No webhooks configured; rendered plans will not be posted");
 	}
 
-	await log("MAIN", "Starting bot");
+	await log(
+		"MAIN",
+		`Starting bot for ${classes.map((cls) => cls.name).join(", ")}`,
+	);
 
 	for (;;) {
 		if (!runOnce) await wait(interval);
 		await log("MAIN", "Trying to check diff");
-		await checkOnce(baseUrl, className, listUrl);
+		await checkOnce(baseUrl, classes, listUrl);
 		if (runOnce) break;
 	}
 }
 
 async function checkOnce(
 	baseUrl: string,
-	className: string,
+	classes: ClassConfig[],
 	listUrl: string,
 ) {
 	const listRes = await schoolFetch(listUrl);
@@ -86,21 +148,32 @@ async function checkOnce(
 
 	const listText = await listRes.text();
 	const listDOM = parse(listText);
-	const classLink = listDOM
-		.querySelectorAll("a")
-		.find((value) => value.textContent.trim() === className.trim())
-		?.attributes["href"];
-	if (!classLink) {
-		await log("LIST", `Class not found ${className}`, "error");
-		return;
-	}
 
+	for (const cls of classes) {
+		const classLink = listDOM
+			.querySelectorAll("a")
+			.find((value) => value.textContent.trim() === cls.name)
+			?.attributes["href"];
+		if (!classLink) {
+			await log("LIST", `${cls.name}: Class not found`, "error");
+			continue;
+		}
+
+		await checkClass(baseUrl, cls, classLink);
+	}
+}
+
+async function checkClass(
+	baseUrl: string,
+	cls: ClassConfig,
+	classLink: string,
+) {
 	const scheduleUrl = new URL(classLink, `${baseUrl}/`).href;
 	const scheduleRes = await schoolFetch(scheduleUrl);
 	if (!scheduleRes.ok) {
 		await log(
 			"SCHEDULE",
-			`Fetch error: ${scheduleRes.statusText} (${scheduleRes.status})`,
+			`${cls.name}: Fetch error: ${scheduleRes.statusText} (${scheduleRes.status})`,
 			"error",
 		);
 		return;
@@ -114,45 +187,51 @@ async function checkOnce(
 		scheduleNew.push(parseDay(i, scheduleDom));
 	}
 
-	if (state.hash == null) {
-		await log("SCHEDULE", "No hash present skipping...");
-		await setState(scheduleText, scheduleNew);
+	const previous = state[cls.name] ?? { hash: null, schedule: [] };
+
+	if (previous.hash == null) {
+		await log("SCHEDULE", `${cls.name}: No hash present skipping...`);
+		await setState(cls.name, scheduleText, scheduleNew);
 		return;
 	}
-	if (state.hash == hashString(scheduleText)) {
-		await log("SCHEDULE", "No changes detected...");
+	if (previous.hash == hashString(scheduleText)) {
+		await log("SCHEDULE", `${cls.name}: No changes detected...`);
 		return;
 	}
 	if (new Date().getMonth() == 7) {
 		const image = renderPlainSchedule(scheduleNew, meta);
 
-		if (!(await postImage(image))) {
+		if (!(await postImage(cls, image))) {
 			await log(
 				"SCHEDULE",
-				"Plan was not posted; keeping previous state",
+				`${cls.name}: Plan was not posted; keeping previous state`,
 				"error",
 			);
 			return;
 		}
-		await setState(scheduleText, scheduleNew);
+		await setState(cls.name, scheduleText, scheduleNew);
 		return;
 	}
 
-	const days = buildDiffDays(state.schedule, scheduleNew);
+	const days = buildDiffDays(previous.schedule, scheduleNew);
 	const image = renderSchedule(days, meta);
 
-	if (!(await postImage(image))) {
-		await log("SCHEDULE", "Plan was not posted; keeping previous state", "error");
+	if (!(await postImage(cls, image))) {
+		await log(
+			"SCHEDULE",
+			`${cls.name}: Plan was not posted; keeping previous state`,
+			"error",
+		);
 		return;
 	}
-	await setState(scheduleText, scheduleNew);
+	await setState(cls.name, scheduleText, scheduleNew);
 }
 
-async function postImage(image: Buffer): Promise<boolean> {
-	if (WEBHOOKS.length === 0) return true;
+async function postImage(cls: ClassConfig, image: Buffer): Promise<boolean> {
+	if (cls.webhooks.length === 0) return true;
 
 	const results = await Promise.allSettled(
-		WEBHOOKS.map(async (url) => {
+		cls.webhooks.map(async (url) => {
 			const body = new FormData();
 			body.append("file", new Blob([new Uint8Array(image)]), "plan.png");
 
@@ -173,10 +252,11 @@ async function postImage(image: Buffer): Promise<boolean> {
 	let posted = 0;
 	for (const result of results) {
 		if (result.status === "fulfilled") posted++;
-		else console.error("Webhook post failed:", result.reason);
+		else console.error(`Webhook post failed for ${cls.name}:`, result.reason);
 	}
-
-	console.log(`Posted plan to ${posted}/${WEBHOOKS.length} webhook(s)`);
+	console.log(
+		`Posted ${cls.name} plan to ${posted}/${cls.webhooks.length} webhook(s)`,
+	);
 	return posted > 0;
 }
 
@@ -350,9 +430,13 @@ function hashString(s: string) {
 	return hash;
 }
 
-async function setState(text: string, scheduleNew: Lesson[][]) {
-	state = { hash: hashString(text), schedule: scheduleNew };
-	await Bun.write("./state.json", JSON.stringify(state));
+async function setState(
+	className: string,
+	text: string,
+	scheduleNew: Lesson[][],
+) {
+	state[className] = { hash: hashString(text), schedule: scheduleNew };
+	await saveState();
 }
 
 type LogLevel = "info" | "error";
