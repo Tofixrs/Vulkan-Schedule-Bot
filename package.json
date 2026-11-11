@@ -1,0 +1,16 @@
+{
+	"name": "schedule_checker",
+	"module": "index.ts",
+	"type": "module",
+	"private": true,
+	"devDependencies": {
+		"@types/bun": "^1.3.14"
+	},
+	"peerDependencies": {
+		"typescript": "^5"
+	},
+	"dependencies": {
+		"@napi-rs/canvas": "^1.1.0",
+		"node-html-parser": "^7.0.1"
+	}
+}
