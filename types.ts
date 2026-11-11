@@ -1,14 +1,7 @@
-export interface GroupDiffrence {
+export interface GroupDifference {
 	subject: boolean;
 	room: boolean;
 	teacher: boolean;
-}
-
-export interface Diffrence {
-	gr1?: GroupDiffrence;
-	gr2?: GroupDiffrence;
-	all?: GroupDiffrence;
-	type: boolean;
 }
 
 export interface Group {
@@ -18,21 +11,45 @@ export interface Group {
 }
 
 export enum LessonType {
-	Seperate,
-	All,
-	Empty,
+	Separate = 0,
+	All = 1,
+	Empty = 2,
 }
 
-export interface Lesson {
-	all?: Group;
-	gr1?: Group;
-	gr2?: Group;
-	type: LessonType;
+interface BaseLesson {
 	nr: number;
 }
 
+export interface AllLesson extends BaseLesson {
+	type: LessonType.All;
+	all: Group;
+}
+
+export interface SeparateLesson extends BaseLesson {
+	type: LessonType.Separate;
+	gr1: Group;
+	gr2: Group;
+}
+
+export interface EmptyLesson extends BaseLesson {
+	type: LessonType.Empty;
+}
+
+export type Lesson = AllLesson | SeparateLesson | EmptyLesson;
+
+export type Difference =
+	| { kind: "none" }
+	| { kind: "type" }
+	| { kind: "all"; all: GroupDifference }
+	| { kind: "separate"; gr1: GroupDifference; gr2: GroupDifference };
+
 export interface LessonDiff {
 	old: Lesson;
-	new: Lesson;
-	diff: Diffrence;
+	next: Lesson;
+	diff: Difference;
+}
+
+export interface ScheduleMeta {
+	dayNames: string[];
+	hours: string[];
 }

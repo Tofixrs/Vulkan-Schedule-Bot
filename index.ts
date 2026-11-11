@@ -1,7 +1,20 @@
 import { parse, type HTMLElement } from "node-html-parser";
+import {
+	DEFAULT_DAY_NAMES,
+	DEFAULT_HOURS,
+	MIN_LESSONS,
+	REQUEST_TIMEOUT_MS,
+} from "./constants.js";
 import { renderPlainSchedule, renderSchedule } from "./renderer.js";
 import { LessonType } from "./types.js";
-import type { Diffrence, GroupDiffrence, Lesson, LessonDiff } from "./types.js";
+import type {
+	Difference,
+	Group,
+	GroupDifference,
+	Lesson,
+	LessonDiff,
+	ScheduleMeta,
+} from "./types.js";
 
 interface State {
 	hash: number | null;
@@ -25,225 +38,303 @@ function requiredEnv(name: string): string {
 	return value;
 }
 
+function schoolFetch(url: string) {
+	return fetch(url, {
+		tls: { rejectUnauthorized: false },
+		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+	});
+}
+
 async function main() {
 	const baseUrl = requiredEnv("BASE_URL").replace(/\/+$/, "");
 	const className = requiredEnv("CLASS");
 	const listUrl = `${baseUrl}/lista.html`;
+	const runOnce = Bun.env.RUN_ONCE === "1";
+	const interval = Number(Bun.env.CHECK_INTERVAL_MS ?? 1000 * 60);
 
 	if (!LOG_URL) {
-		console.warn("LOG_URL is not set; logs will only go to stderr");
+		console.warn("LOG_URL is not set; logs will only go to the console");
 	}
 	if (WEBHOOKS.length === 0) {
 		console.warn("No WEBHOOKS configured; rendered plans will not be posted");
 	}
 
 	await log("MAIN", "Starting bot");
-	while (true) {
-		await wait(1000 * 60);
+
+	for (;;) {
+		if (!runOnce) await wait(interval);
 		await log("MAIN", "Trying to check diff");
-		const listRes = await fetch(listUrl);
-		if (!listRes.ok) {
-			await log(
-				"LIST",
-				`Fetch error: ${listRes.statusText} (${listRes.status})`,
-			);
-			continue;
-		}
-
-		const listText = await listRes.text();
-		const listDOM = parse(listText);
-		const classLink = listDOM
-			.querySelectorAll("a")
-			.find((value) => value.textContent == className)?.attributes[
-			"href"
-		];
-		if (!classLink) {
-			await log("LIST", `Class not found ${className}`);
-			continue;
-		}
-
-		const scheduleRes = await fetch(`${baseUrl}/${classLink}`);
-		if (!scheduleRes.ok) {
-			await log(
-				"SCHEDULE",
-				`Fetch error: ${scheduleRes.statusText} (${scheduleRes.status})`,
-			);
-			continue;
-		}
-
-		const scheduleText = await scheduleRes.text();
-		const scheduleDom = parse(scheduleText);
-		const scheduleNew: Lesson[][] = [];
-		for (let i = 0; i < 5; i++) {
-			scheduleNew.push(parseDay(i, scheduleDom));
-		}
-
-		if (state.hash == null) {
-			await log("SCHEDULE", "No hash present skipping...");
-			await setState(scheduleText, scheduleNew);
-			continue;
-		}
-		if (state.hash == hashString(scheduleText)) {
-			await log("SCHEDULE", "No changes detected...");
-			continue;
-		}
-		if (new Date().getMonth() == 7) {
-			const image = renderPlainSchedule(scheduleNew);
-
-			await postImage(image);
-			await setState(scheduleText, scheduleNew);
-			continue;
-		}
-
-		const diff: Diffrence[][] = [];
-
-		for (let i = 0; i < 5; i++) {
-			const dayDiff: Diffrence[] = [];
-			for (let j = 0; j < 13; j++) {
-				const currLesson = scheduleNew[i][j];
-				const lastLesson = state.schedule[i][j];
-				if (currLesson.type != lastLesson.type) {
-					dayDiff.push({ type: true });
-					continue;
-				}
-
-				if (currLesson.type == LessonType.Seperate) {
-					const group1Res: GroupDiffrence = {
-						subject: false,
-						room: false,
-						teacher: false,
-					};
-					const group2Res: GroupDiffrence = {
-						subject: false,
-						room: false,
-						teacher: false,
-					};
-					for (const k of Object.keys(currLesson.gr1!)) {
-						const key = k as "subject" | "room" | "teacher";
-						if (currLesson.gr1![key] == lastLesson.gr1![key]) continue;
-						group1Res[key] = true;
-					}
-					for (const k of Object.keys(currLesson.gr2!)) {
-						const key = k as "subject" | "room" | "teacher";
-						if (currLesson.gr2![key] == lastLesson.gr2![key]) continue;
-						group2Res[key] = true;
-					}
-					dayDiff.push({ type: false, gr1: group1Res, gr2: group2Res });
-				} else if (currLesson.type == LessonType.All) {
-					const res: GroupDiffrence = {
-						subject: false,
-						room: false,
-						teacher: false,
-					};
-					for (const k of Object.keys(currLesson.all!)) {
-						const key = k as "subject" | "room" | "teacher";
-						if (currLesson.all![key] == lastLesson.all![key]) continue;
-						res[key] = true;
-					}
-					dayDiff.push({ type: false, all: res });
-				} else {
-					dayDiff.push({ type: false });
-				}
-			}
-			diff.push(dayDiff);
-		}
-
-		const days: LessonDiff[][] = [];
-
-		for (let i = 0; i < 5; i++) {
-			const dayData: LessonDiff[] = [];
-			for (let j = 0; j < 13; j++) {
-				dayData.push({
-					old: state.schedule[i][j],
-					new: scheduleNew[i][j],
-					diff: diff[i][j],
-				});
-			}
-			days.push(dayData);
-		}
-
-		const image = renderSchedule(days);
-
-		await postImage(image);
-		await setState(scheduleText, scheduleNew);
+		await checkOnce(baseUrl, className, listUrl);
+		if (runOnce) break;
 	}
 }
 
-async function postImage(image: Buffer) {
-	if (WEBHOOKS.length === 0) return;
+async function checkOnce(
+	baseUrl: string,
+	className: string,
+	listUrl: string,
+) {
+	const listRes = await schoolFetch(listUrl);
+	if (!listRes.ok) {
+		await log(
+			"LIST",
+			`Fetch error: ${listRes.statusText} (${listRes.status})`,
+			"error",
+		);
+		return;
+	}
 
-	const body = new FormData();
-	body.append("file", new Blob([new Uint8Array(image)]), "plan.png");
+	const listText = await listRes.text();
+	const listDOM = parse(listText);
+	const classLink = listDOM
+		.querySelectorAll("a")
+		.find((value) => value.textContent.trim() === className.trim())
+		?.attributes["href"];
+	if (!classLink) {
+		await log("LIST", `Class not found ${className}`, "error");
+		return;
+	}
 
-	await Promise.all(
-		WEBHOOKS.map((url) =>
-			fetch(url, {
+	const scheduleUrl = new URL(classLink, `${baseUrl}/`).href;
+	const scheduleRes = await schoolFetch(scheduleUrl);
+	if (!scheduleRes.ok) {
+		await log(
+			"SCHEDULE",
+			`Fetch error: ${scheduleRes.statusText} (${scheduleRes.status})`,
+			"error",
+		);
+		return;
+	}
+
+	const scheduleText = await scheduleRes.text();
+	const scheduleDom = parse(scheduleText);
+	const meta = parseMeta(scheduleDom);
+	const scheduleNew: Lesson[][] = [];
+	for (let i = 0; i < meta.dayNames.length; i++) {
+		scheduleNew.push(parseDay(i, scheduleDom));
+	}
+
+	if (state.hash == null) {
+		await log("SCHEDULE", "No hash present skipping...");
+		await setState(scheduleText, scheduleNew);
+		return;
+	}
+	if (state.hash == hashString(scheduleText)) {
+		await log("SCHEDULE", "No changes detected...");
+		return;
+	}
+	if (new Date().getMonth() == 7) {
+		const image = renderPlainSchedule(scheduleNew, meta);
+
+		if (!(await postImage(image))) {
+			await log(
+				"SCHEDULE",
+				"Plan was not posted; keeping previous state",
+				"error",
+			);
+			return;
+		}
+		await setState(scheduleText, scheduleNew);
+		return;
+	}
+
+	const days = buildDiffDays(state.schedule, scheduleNew);
+	const image = renderSchedule(days, meta);
+
+	if (!(await postImage(image))) {
+		await log("SCHEDULE", "Plan was not posted; keeping previous state", "error");
+		return;
+	}
+	await setState(scheduleText, scheduleNew);
+}
+
+async function postImage(image: Buffer): Promise<boolean> {
+	if (WEBHOOKS.length === 0) return true;
+
+	const results = await Promise.allSettled(
+		WEBHOOKS.map(async (url) => {
+			const body = new FormData();
+			body.append("file", new Blob([new Uint8Array(image)]), "plan.png");
+
+			const res = await fetch(url, {
 				method: "POST",
 				body,
-			}),
-		),
+				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			});
+			if (!res.ok) {
+				throw new Error(
+					`Webhook post failed: ${res.status} ${res.statusText}`,
+				);
+			}
+			return res.status;
+		}),
 	);
+
+	let posted = 0;
+	for (const result of results) {
+		if (result.status === "fulfilled") posted++;
+		else console.error("Webhook post failed:", result.reason);
+	}
+
+	console.log(`Posted plan to ${posted}/${WEBHOOKS.length} webhook(s)`);
+	return posted > 0;
+}
+
+function emptyLesson(nr: number): Lesson {
+	return { type: LessonType.Empty, nr };
+}
+
+function diffGroup(oldGroup: Group, nextGroup: Group): GroupDifference {
+	return {
+		subject: oldGroup.subject !== nextGroup.subject,
+		room: oldGroup.room !== nextGroup.room,
+		teacher: oldGroup.teacher !== nextGroup.teacher,
+	};
+}
+
+function diffLessons(oldLesson: Lesson, nextLesson: Lesson): Difference {
+	if (oldLesson.type !== nextLesson.type) return { kind: "type" };
+
+	switch (oldLesson.type) {
+		case LessonType.All:
+			if (nextLesson.type !== LessonType.All) return { kind: "type" };
+			return {
+				kind: "all",
+				all: diffGroup(oldLesson.all, nextLesson.all),
+			};
+		case LessonType.Separate:
+			if (nextLesson.type !== LessonType.Separate) {
+				return { kind: "type" };
+			}
+			return {
+				kind: "separate",
+				gr1: diffGroup(oldLesson.gr1, nextLesson.gr1),
+				gr2: diffGroup(oldLesson.gr2, nextLesson.gr2),
+			};
+		case LessonType.Empty:
+			return { kind: "none" };
+	}
+
+	return { kind: "none" };
+}
+
+function buildDiffDays(
+	previousSchedule: Lesson[][],
+	currentSchedule: Lesson[][],
+): LessonDiff[][] {
+	const rows = currentSchedule.reduce(
+		(max, currentDay, day) =>
+			Math.max(max, currentDay.length, previousSchedule[day]?.length ?? 0),
+		0,
+	);
+
+	return currentSchedule.map((currentDay, day) => {
+		const previousDay = previousSchedule[day] ?? [];
+		const dayData: LessonDiff[] = [];
+
+		for (let row = 0; row < rows; row++) {
+			const oldLesson = previousDay[row] ?? emptyLesson(row + 1);
+			const nextLesson = currentDay[row] ?? emptyLesson(row + 1);
+			dayData.push({
+				old: oldLesson,
+				next: nextLesson,
+				diff: diffLessons(oldLesson, nextLesson),
+			});
+		}
+
+		return dayData;
+	});
+}
+
+export function parseMeta(node: HTMLElement): ScheduleMeta {
+	const table = node.querySelector(".tabela");
+	const headerCells =
+		table?.querySelectorAll("tr")[0]?.querySelectorAll("th") ?? [];
+	const dayNames = headerCells
+		.slice(2)
+		.map((cell) => cell.textContent.trim())
+		.filter(Boolean);
+
+	const hoursByNumber = new Map<number, string>();
+	for (const cell of table?.querySelectorAll("td.g") ?? []) {
+		const nrText = cell.parentNode?.querySelector(".nr")?.textContent ?? "";
+		const nr = Number.parseInt(nrText, 10);
+		if (!Number.isFinite(nr)) continue;
+
+		const label = cell.textContent.trim().replace(/\s*-\s*/g, "-");
+		if (label) hoursByNumber.set(nr, label);
+	}
+
+	const lessonCount = Math.max(MIN_LESSONS, ...hoursByNumber.keys());
+	return {
+		dayNames: dayNames.length > 0 ? dayNames : DEFAULT_DAY_NAMES,
+		hours: Array.from(
+			{ length: lessonCount },
+			(_, index) =>
+				hoursByNumber.get(index + 1) ?? DEFAULT_HOURS[index] ?? "",
+		),
+	};
 }
 
 export function parseDay(dayNr: number, node: HTMLElement): Lesson[] {
-	let res = node
-		.querySelectorAll(`.tabela tr td:nth-child(${dayNr + 3})`)
-		.map((v) => {
-			const nr = parseInt(v.parentNode.querySelector(".nr")!.textContent);
-			if (v.children.length == 0) return { type: LessonType.Empty, nr };
-			const subjects = v.querySelectorAll(".p");
-			const teachers = subjects.map((v) => v.querySelector("+.n")!);
-			const rooms = teachers.map((v) => v.querySelector("+.s"));
+	const byNumber = new Map<number, Lesson>();
 
-			if (subjects.length > 1) {
-				return {
-					gr1: {
-						teacher: teachers[0]!.textContent,
-						subject: subjects[0].textContent,
-						room: rooms[0]!.textContent,
-					},
-					gr2: {
-						teacher: teachers[1]!.textContent,
-						subject: subjects[1].textContent,
-						room: rooms[1]!.textContent,
-					},
-					type: LessonType.Seperate,
-					nr,
-				};
-			} else {
-				return {
-					all: {
-						teacher: teachers[0]!.textContent,
-						subject: subjects[0].textContent,
-						room: rooms[0]!.textContent,
-					},
-					type: LessonType.All,
-					nr,
-				};
-			}
-		})
-		.sort((a, b) => a.nr - b.nr);
+	for (const cell of node.querySelectorAll(
+		`.tabela tr td:nth-child(${dayNr + 3})`,
+	)) {
+		const nrText = cell.parentNode?.querySelector(".nr")?.textContent ?? "";
+		const nr = Number.parseInt(nrText, 10);
+		if (!Number.isFinite(nr)) continue;
 
-	if (res.length < 13) {
-		const lastNr = res[res.length - 1].nr;
-		const firstNr = res[0].nr;
-		res.push(
-			...Array.from({ length: 13 - lastNr }).map((_, i) => ({
-				nr: lastNr + i + 1,
-				type: LessonType.Empty,
-			})),
+		const subjects = cell.querySelectorAll(".p");
+		if (subjects.length === 0) {
+			byNumber.set(nr, emptyLesson(nr));
+			continue;
+		}
+
+		const teacherNodes = subjects.map((subject) =>
+			subject.querySelector("+.n"),
 		);
-		if (firstNr != 1) {
-			res = [
-				...Array.from({ length: firstNr - 1 }).map((_, i) => ({
-					nr: i + 1,
-					type: LessonType.Empty,
-				})),
-				...res,
-			];
+		const teachers = teacherNodes.map(
+			(teacher) => teacher?.textContent.trim() ?? "",
+		);
+		const rooms = teacherNodes.map(
+			(teacher) => teacher?.querySelector("+.s")?.textContent.trim() ?? "",
+		);
+
+		if (subjects.length > 1) {
+			byNumber.set(nr, {
+				type: LessonType.Separate,
+				nr,
+				gr1: {
+					teacher: teachers[0] ?? "",
+					subject: subjects[0].textContent.trim(),
+					room: rooms[0] ?? "",
+				},
+				gr2: {
+					teacher: teachers[1] ?? "",
+					subject: subjects[1].textContent.trim(),
+					room: rooms[1] ?? "",
+				},
+			});
+		} else {
+			byNumber.set(nr, {
+				type: LessonType.All,
+				nr,
+				all: {
+					teacher: teachers[0] ?? "",
+					subject: subjects[0].textContent.trim(),
+					room: rooms[0] ?? "",
+				},
+			});
 		}
 	}
-	return res;
+
+	const lessonCount = Math.max(MIN_LESSONS, ...byNumber.keys());
+	return Array.from(
+		{ length: lessonCount },
+		(_, index) => byNumber.get(index + 1) ?? emptyLesson(index + 1),
+	);
 }
 
 function hashString(s: string) {
@@ -264,11 +355,18 @@ async function setState(text: string, scheduleNew: Lesson[][]) {
 	await Bun.write("./state.json", JSON.stringify(state));
 }
 
-async function log(header: string, text: string) {
+type LogLevel = "info" | "error";
+
+async function log(
+	header: string,
+	text: string,
+	level: LogLevel = "info",
+) {
 	const message = `[${header}]: ${text}`;
 
-	if (!LOG_URL) {
-		console.error(message);
+	console.log(message);
+
+	if (level === "info" || !LOG_URL) {
 		return;
 	}
 
@@ -279,6 +377,7 @@ async function log(header: string, text: string) {
 				"content-type": "application/json",
 			},
 			body: JSON.stringify({ content: message }),
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
 	} catch (error) {
 		console.error("log webhook failed:", error);
@@ -294,7 +393,7 @@ function wait(time: number) {
 		await main();
 	} catch (error) {
 		const ping = LOG_PING_ID ? `<@${LOG_PING_ID}> ` : "";
-		await log("MAIN", ping + String(error));
+		await log("MAIN", ping + String(error), "error");
 		throw error;
 	}
 })();

@@ -8,9 +8,10 @@ import { fileURLToPath } from "node:url";
 import { LessonType } from "./types.js";
 import type {
 	Group,
-	GroupDiffrence,
+	GroupDifference,
 	Lesson,
 	LessonDiff,
+	ScheduleMeta,
 } from "./types.js";
 
 const FONT_DIR = join(dirname(fileURLToPath(import.meta.url)), "assets", "fonts");
@@ -22,39 +23,12 @@ const CARD_Y = PAD;
 const CARD_W = WIDTH - PAD * 2;
 const HEADER_H = 60;
 const MIN_ROW_H = 100;
-const ROWS = 13;
 const NUM_W = 60;
 const HOUR_W = 160;
-const DAY_W = (CARD_W - NUM_W - HOUR_W) / 5;
-const COLUMNS = [NUM_W, HOUR_W, DAY_W, DAY_W, DAY_W, DAY_W, DAY_W];
 
 const BOX_H = 48;
 const BOX_GAP = 4;
 const CELL_PAD = 6;
-
-const DAY_NAMES = [
-	"Poniedziałek",
-	"Wtorek",
-	"Środa",
-	"Czwartek",
-	"Piątek",
-];
-
-const HOURS = [
-	"07:10-7:55",
-	"8:00-8:45",
-	"8:50-9:35",
-	"9:40-10:25",
-	"10:40-11:25",
-	"11:30-12:15",
-	"12:20-13:05",
-	"13:10-13:55",
-	"14:00-14:45",
-	"14:50-15:35",
-	"15:50-16:35",
-	"16:40-17:25",
-	"17:30-18:15",
-];
 
 const COLORS = {
 	bg: "#f1f5f9",
@@ -351,27 +325,23 @@ function drawGroupStack(
 }
 
 function lessonBoxes(lesson: Lesson, variant: GroupVariant): GroupBox[] {
-	const boxes: GroupBox[] = [];
-
 	switch (lesson.type) {
 		case LessonType.All:
-			if (lesson.all) boxes.push({ group: lesson.all, variant });
-			break;
-		case LessonType.Seperate:
-			if (lesson.gr1) boxes.push({ group: lesson.gr1, variant });
-			if (lesson.gr2) boxes.push({ group: lesson.gr2, variant });
-			break;
+			return [{ group: lesson.all, variant }];
+		case LessonType.Separate:
+			return [
+				{ group: lesson.gr1, variant },
+				{ group: lesson.gr2, variant },
+			];
 		case LessonType.Empty:
-			break;
+			return [];
 	}
-
-	return boxes;
 }
 
 function groupDiffBoxes(
 	oldGroup: Group,
 	newGroup: Group,
-	diff: GroupDiffrence,
+	diff: GroupDifference,
 ): GroupBox[] {
 	const changed = diff.teacher || diff.subject || diff.room;
 
@@ -384,42 +354,48 @@ function groupDiffBoxes(
 }
 
 function lessonDiffBoxes(item: LessonDiff): GroupBox[] {
-	const { old, new: next, diff } = item;
+	const { old, next, diff } = item;
 
-	if (!diff.type) {
-		if (old.type === LessonType.All) {
-			return groupDiffBoxes(old.all!, next.all!, diff.all!);
-		}
-		if (old.type === LessonType.Seperate) {
-			return [
-				...groupDiffBoxes(old.gr1!, next.gr1!, diff.gr1!),
-				...groupDiffBoxes(old.gr2!, next.gr2!, diff.gr2!),
-			];
-		}
-		return [];
-	}
-
-	switch (next.type) {
-		case LessonType.All:
-		case LessonType.Seperate:
+	switch (diff.kind) {
+		case "none":
+			return [];
+		case "type":
 			return [
 				...lessonBoxes(old, "old"),
 				...lessonBoxes(next, "new"),
 			];
-		case LessonType.Empty:
-			return lessonBoxes(old, "old");
+		case "all":
+			if (old.type !== LessonType.All || next.type !== LessonType.All) {
+				return [];
+			}
+			return groupDiffBoxes(old.all, next.all, diff.all);
+		case "separate":
+			if (
+				old.type !== LessonType.Separate ||
+				next.type !== LessonType.Separate
+			) {
+				return [];
+			}
+			return [
+				...groupDiffBoxes(old.gr1, next.gr1, diff.gr1),
+				...groupDiffBoxes(old.gr2, next.gr2, diff.gr2),
+			];
 	}
+
+	return [];
 }
 
 function lessonBoxCount(lesson: Lesson): number {
 	switch (lesson.type) {
 		case LessonType.All:
-			return lesson.all ? 1 : 0;
-		case LessonType.Seperate:
-			return (lesson.gr1 ? 1 : 0) + (lesson.gr2 ? 1 : 0);
+			return 1;
+		case LessonType.Separate:
+			return 2;
 		case LessonType.Empty:
 			return 0;
 	}
+
+	return 0;
 }
 
 function rowHeight(boxCounts: number[]): number {
@@ -430,6 +406,8 @@ function rowHeight(boxCounts: number[]): number {
 }
 
 function drawTable(
+	meta: ScheduleMeta,
+	rowHeights: number[],
 	drawCell: (
 		ctx: SKRSContext2D,
 		day: number,
@@ -439,10 +417,13 @@ function drawTable(
 		w: number,
 		h: number,
 	) => void,
-	rowHeights: number[],
 ) {
 	ensureFonts();
 
+	const days = meta.dayNames.length;
+	const rows = rowHeights.length;
+	const dayW = (CARD_W - NUM_W - HOUR_W) / days;
+	const columns = [NUM_W, HOUR_W, ...Array.from({ length: days }, () => dayW)];
 	const tableH = rowHeights.reduce((sum, h) => sum + h, HEADER_H);
 	const cardH = tableH;
 	const height = cardH + PAD * 2;
@@ -469,10 +450,10 @@ function drawTable(
 	ctx.fillStyle = COLORS.headerBg;
 	ctx.fillRect(CARD_X, CARD_Y, CARD_W, HEADER_H);
 
-	const headers = ["#", "Godz.", ...DAY_NAMES];
+	const headers = ["#", "Godz.", ...meta.dayNames];
 	let headerX = CARD_X;
 	for (let i = 0; i < headers.length; i++) {
-		const columnW = COLUMNS[i];
+		const columnW = columns[i];
 
 		if (i < headers.length - 1) {
 			ctx.strokeStyle = COLORS.headerBorder;
@@ -498,13 +479,13 @@ function drawTable(
 
 	const rowY: number[] = [];
 	let cursorY = CARD_Y + HEADER_H;
-	for (let row = 0; row < ROWS; row++) {
+	for (let row = 0; row < rows; row++) {
 		rowY[row] = cursorY;
 
 		const isAlt = row % 2 === 1;
 		let cellX = CARD_X;
-		for (let col = 0; col < COLUMNS.length; col++) {
-			const columnW = COLUMNS[col];
+		for (let col = 0; col < columns.length; col++) {
+			const columnW = columns[col];
 			ctx.fillStyle =
 				col < 2 ? COLORS.numBg : isAlt ? COLORS.rowAlt : COLORS.card;
 			ctx.fillRect(cellX, cursorY, columnW, rowHeights[row]);
@@ -516,8 +497,8 @@ function drawTable(
 
 	ctx.strokeStyle = COLORS.cellBorder;
 	ctx.lineWidth = 1;
-	for (let row = 0; row <= ROWS; row++) {
-		const lineY = row === ROWS ? CARD_Y + cardH : rowY[row];
+	for (let row = 0; row <= rows; row++) {
+		const lineY = row === rows ? CARD_Y + cardH : rowY[row];
 		ctx.beginPath();
 		ctx.moveTo(CARD_X, lineY);
 		ctx.lineTo(CARD_X + CARD_W, lineY);
@@ -525,14 +506,14 @@ function drawTable(
 	}
 	let lineX = CARD_X;
 	ctx.beginPath();
-	for (let col = 0; col <= COLUMNS.length; col++) {
+	for (let col = 0; col <= columns.length; col++) {
 		ctx.moveTo(lineX, CARD_Y);
 		ctx.lineTo(lineX, CARD_Y + cardH);
-		lineX += COLUMNS[col] ?? 0;
+		lineX += columns[col] ?? 0;
 	}
 	ctx.stroke();
 
-	for (let row = 0; row < ROWS; row++) {
+	for (let row = 0; row < rows; row++) {
 		const currentY = rowY[row];
 		const midY = currentY + rowHeights[row] / 2;
 
@@ -544,17 +525,21 @@ function drawTable(
 
 		setPlex(ctx, 500, 16);
 		ctx.fillStyle = COLORS.slate600;
-		ctx.fillText(HOURS[row], CARD_X + NUM_W + HOUR_W / 2, midY);
+		ctx.fillText(
+			meta.hours[row] ?? "",
+			CARD_X + NUM_W + HOUR_W / 2,
+			midY,
+		);
 
-		for (let day = 0; day < 5; day++) {
-			const dayX = CARD_X + NUM_W + HOUR_W + day * DAY_W;
+		for (let day = 0; day < days; day++) {
+			const dayX = CARD_X + NUM_W + HOUR_W + day * dayW;
 			drawCell(
 				ctx,
 				day,
 				row,
 				dayX + CELL_PAD,
 				currentY + CELL_PAD,
-				DAY_W - CELL_PAD * 2,
+				dayW - CELL_PAD * 2,
 				rowHeights[row] - CELL_PAD * 2,
 			);
 		}
@@ -571,13 +556,14 @@ function drawTable(
 }
 
 function diffRowHeights(days: LessonDiff[][]): number[] {
-	const heights: number[] = new Array(ROWS).fill(MIN_ROW_H);
+	const rows = days[0]?.length ?? 0;
+	const heights: number[] = new Array(rows).fill(MIN_ROW_H);
 
-	for (let row = 0; row < ROWS; row++) {
-		const counts: number[] = [];
-		for (let day = 0; day < 5; day++) {
-			counts.push(lessonDiffBoxes(days[day][row]).length);
-		}
+	for (let row = 0; row < rows; row++) {
+		const counts = days.map((day) => {
+			const item = day[row];
+			return item ? lessonDiffBoxes(item).length : 0;
+		});
 		heights[row] = rowHeight(counts);
 	}
 
@@ -585,31 +571,40 @@ function diffRowHeights(days: LessonDiff[][]): number[] {
 }
 
 function plainRowHeights(schedule: Lesson[][]): number[] {
-	const heights: number[] = new Array(ROWS).fill(MIN_ROW_H);
+	const rows = schedule[0]?.length ?? 0;
+	const heights: number[] = new Array(rows).fill(MIN_ROW_H);
 
-	for (let row = 0; row < ROWS; row++) {
-		const counts: number[] = [];
-		for (let day = 0; day < 5; day++) {
-			counts.push(lessonBoxCount(schedule[day][row]));
-		}
+	for (let row = 0; row < rows; row++) {
+		const counts = schedule.map((day) => {
+			const lesson = day[row];
+			return lesson ? lessonBoxCount(lesson) : 0;
+		});
 		heights[row] = rowHeight(counts);
 	}
 
 	return heights;
 }
 
-export function renderSchedule(days: LessonDiff[][]): Buffer {
+export function renderSchedule(
+	days: LessonDiff[][],
+	meta: ScheduleMeta,
+): Buffer {
 	const rowHeights = diffRowHeights(days);
 
-	return drawTable((ctx, day, row, x, y, w, h) => {
-		drawGroupStack(ctx, lessonDiffBoxes(days[day][row]), x, y, w, h);
-	}, rowHeights);
+	return drawTable(meta, rowHeights, (ctx, day, row, x, y, w, h) => {
+		const item = days[day]?.[row];
+		if (item) drawGroupStack(ctx, lessonDiffBoxes(item), x, y, w, h);
+	});
 }
 
-export function renderPlainSchedule(schedule: Lesson[][]): Buffer {
+export function renderPlainSchedule(
+	schedule: Lesson[][],
+	meta: ScheduleMeta,
+): Buffer {
 	const rowHeights = plainRowHeights(schedule);
 
-	return drawTable((ctx, day, row, x, y, w, h) => {
-		drawGroupStack(ctx, lessonBoxes(schedule[day][row], "plain"), x, y, w, h);
-	}, rowHeights);
+	return drawTable(meta, rowHeights, (ctx, day, row, x, y, w, h) => {
+		const lesson = schedule[day]?.[row];
+		if (lesson) drawGroupStack(ctx, lessonBoxes(lesson, "plain"), x, y, w, h);
+	});
 }
